@@ -1,0 +1,43 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "alchemist-transcriber"
+version = "0.1.0"
+description = "Whisper ASR + diarization → markdown transcript (MLX or PyTorch)"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "mlx-whisper>=0.4.0",
+    "soundfile>=0.12",
+    "PyYAML>=6.0",
+    "diarize>=0.1.1",
+    "python-dotenv>=1.0",
+]
+
+[project.optional-dependencies]
+torch-pipeline = [
+    "openai-whisper>=20240930",
+    "torch>=2.2",
+    "torchaudio>=2.2",
+    "pyannote-audio>=3.1,<4",
+]
+
+[project.scripts]
+transcribe = "cli:main"
+alchemist-check-enrollment = "check_enrollment:main"
+
+[tool.setuptools]
+py-modules = [
+    "cli",
+    "check_enrollment",
+    "enrollment_util",
+    "audio_preprocess",
+    "diar_types",
+    "torch_pipeline",
+    "transcript_fixes",
+]
+
+[tool.setuptools.package-dir]
+"" = "src"

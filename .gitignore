@@ -1,0 +1,18 @@
+.venv/
+.env
+*.egg-info/
+__pycache__/
+*.py[cod]
+.DS_Store
+*.tmp
+*.md.tmp
+data/
+output/
+embeddings/
+
+# Speaker enrollment clips are local/private; add danil.* and therapist.* yourself.
+enrollments/*.wav
+enrollments/*.m4a
+enrollments/*.mp3
+enrollments/*.flac
+enrollments/*.ogg
