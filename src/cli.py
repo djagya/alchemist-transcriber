@@ -13,9 +13,11 @@ Env:
     Clips: danil.* and therapist.* with extensions .wav, .m4a, .mp3, .flac, .ogg.
   ALCHEMIST_SKIP_FFMPEG_NORMALIZE — if 1/true, do not run ffmpeg; use the original file as-is.
   ALCHEMIST_WHISPER_REPO — MLX Hub repo (mlx pipeline only; default mlx-community/whisper-large-v3-mlx).
-    Smaller repos (e.g. whisper-medium-mlx, whisper-small-mlx) use less RAM at some accuracy cost.
-  ALCHEMIST_WORD_TIMESTAMPS — mlx pipeline: 1 (default) | 0 — set 0 to disable per-word timestamps
-    (lower MLX memory; transcript still uses segment-level timing from Whisper).
+    Recommended alternative: mlx-community/whisper-large-v3-turbo (distilled, 4 decoder layers instead of 32,
+    much lower GPU RAM — similar to what MacWhisper uses).
+    Other options: whisper-medium-mlx, whisper-small-mlx (less RAM at some accuracy cost).
+  ALCHEMIST_WORD_TIMESTAMPS — mlx pipeline: 0 (default) | 1 — set 1 to enable per-word timestamps
+    (costs significantly more GPU RAM; speaker-section timestamps use diarization, not word timestamps).
   ALCHEMIST_MLX_CONDITION_ON_PREVIOUS_TEXT — mlx: 1 | 0 (default) — if 1, Whisper passes prior decoded
     text into the next window (may help names/context; can revive repetition hallucinations and slow decode).
   ALCHEMIST_MLX_NO_SPEECH_THRESHOLD — optional float; mlx only; mlx_whisper default 0.6.
@@ -38,6 +40,12 @@ Env:
     fields). Default output uses a short frontmatter only.
   ALCHEMIST_NO_LOG_FILE — 1 | 0 (default) — disable per-run debug log file under logs/ (or ALCHEMIST_LOG_DIR).
   ALCHEMIST_LOG_DIR — optional absolute directory for run log files (default: <repo>/logs).
+  ALCHEMIST_MLX_CHUNK_SECONDS — mlx only: max seconds of audio per mlx_whisper.transcribe call (default 300).
+    mlx_whisper allocates a full mel for the whole clip each call; chunking keeps GPU RAM bounded on long files.
+    Set 0/off/false to use one call (legacy, high RAM on long audio).
+  ALCHEMIST_MLX_CHUNK_OVERLAP_SECONDS — seconds of overlap between chunks (default 2); trims duplicate boundary text.
+  ALCHEMIST_MLX_CACHE_LIMIT_GB — mlx only: cap the Metal allocator cache (default 2.0 GB).
+    Freed GPU buffers above this limit are returned to the OS immediately. 0 = MLX default (no cap).
 """
 
 from __future__ import annotations
@@ -98,8 +106,8 @@ def _whisper_repo() -> str:
 
 
 def _mlx_word_timestamps() -> bool:
-    raw = os.environ.get("ALCHEMIST_WORD_TIMESTAMPS", "1").strip().lower()
-    return raw not in ("0", "false", "no", "off")
+    raw = os.environ.get("ALCHEMIST_WORD_TIMESTAMPS", "0").strip().lower()
+    return raw in ("1", "true", "yes", "on")
 
 
 def _mlx_condition_on_previous_text() -> bool:
@@ -139,6 +147,251 @@ def _mlx_decode_overrides_from_env() -> tuple[dict[str, Any], dict[str, float]]:
             kw[arg] = v
             meta[arg] = v
     return kw, meta
+
+
+def _mlx_chunk_seconds() -> float:
+    """Upper bound on audio length per mlx_whisper call; 0 = single full-file call (high RAM)."""
+    raw = os.environ.get("ALCHEMIST_MLX_CHUNK_SECONDS", "300").strip().lower()
+    if raw in ("", "0", "off", "false", "no"):
+        return 0.0
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        return 300.0
+
+
+def _mlx_chunk_overlap_seconds() -> float:
+    raw = os.environ.get("ALCHEMIST_MLX_CHUNK_OVERLAP_SECONDS", "2.0").strip()
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        return 2.0
+
+
+def _mlx_cache_limit_gb() -> float:
+    raw = os.environ.get("ALCHEMIST_MLX_CACHE_LIMIT_GB", "2.0").strip()
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        return 2.0
+
+
+def _free_torch_memory() -> None:
+    """Release PyTorch memory (CPU heap + MPS/CUDA GPU) after a stage that used torch."""
+    gc.collect()
+    try:
+        import torch
+        if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            torch.mps.empty_cache()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:
+        pass
+    _LOG.debug("_free_torch_memory: gc.collect + torch cache emptied")
+
+
+def _apply_mlx_cache_limit() -> None:
+    """Cap the MLX Metal allocator cache so freed GPU buffers are returned to the OS."""
+    limit_gb = _mlx_cache_limit_gb()
+    if limit_gb <= 0.0:
+        return
+    try:
+        import mlx.core as mx
+        limit_bytes = int(limit_gb * (1 << 30))
+        mx.set_cache_limit(limit_bytes)
+        _LOG.info("mx.set_cache_limit(%d bytes = %.1f GB)", limit_bytes, limit_gb)
+    except Exception as e:
+        _LOG.warning("mx.set_cache_limit failed: %s", e)
+
+
+def _mlx_carry_prompt(base: str, prev_local_segments: list[dict], max_extra: int = 450) -> str:
+    """Append recent text from the previous chunk so Whisper has context at boundaries."""
+    parts: list[str] = []
+    for seg in reversed(prev_local_segments[-6:]):
+        t = (seg.get("text") or "").strip()
+        if t:
+            parts.append(t)
+    tail = " ".join(reversed(parts))
+    if len(tail) > max_extra:
+        tail = tail[-max_extra:]
+    if not tail:
+        return base
+    return f"{base}\n\n… {tail}"
+
+
+def _mlx_offset_segments(
+    segments: list[dict],
+    t0_sec: float,
+    *,
+    drop_end_local_le: float | None,
+) -> list[dict]:
+    """Shift timestamps to global time; drop segments fully inside overlap duplicate zone."""
+    out: list[dict] = []
+    eps = 1e-3
+    for seg in segments:
+        try:
+            la = float(seg.get("start", 0.0))
+            lb = float(seg.get("end", 0.0))
+        except (TypeError, ValueError):
+            continue
+        if drop_end_local_le is not None and lb <= drop_end_local_le + eps:
+            continue
+        ns = dict(seg)
+        ns["start"] = la + t0_sec
+        ns["end"] = lb + t0_sec
+        words = ns.get("words")
+        if isinstance(words, list):
+            nw: list[dict] = []
+            for w in words:
+                if not isinstance(w, dict):
+                    continue
+                wc = dict(w)
+                try:
+                    wc["start"] = float(w["start"]) + t0_sec
+                    wc["end"] = float(w["end"]) + t0_sec
+                except (KeyError, TypeError, ValueError):
+                    pass
+                nw.append(wc)
+            ns["words"] = nw
+        out.append(ns)
+    return out
+
+
+def _mlx_transcribe_path_batched(
+    audio_path: Path,
+    duration_sec: float,
+    whisper_kw: dict[str, Any],
+    mlx_whisper_mod: Any,
+) -> tuple[dict[str, Any], int]:
+    """Transcribe in time windows so each mlx_whisper call builds a bounded mel (not whole-hour tensor)."""
+    chunk_sec = _mlx_chunk_seconds()
+    overlap_sec = _mlx_chunk_overlap_seconds()
+    path_str = str(audio_path)
+
+    if chunk_sec <= 0.0 or duration_sec <= chunk_sec + 0.5:
+        _LOG.info(
+            "mlx: single-shot transcribe (mlx_chunk_seconds=%r duration=%.1fs)",
+            chunk_sec if chunk_sec > 0 else "off",
+            duration_sec,
+        )
+        return mlx_whisper_mod.transcribe(path_str, **whisper_kw), 1
+
+    try:
+        info = sf.info(path_str)
+    except OSError as e:
+        _LOG.warning("mlx: chunked transcribe failed to probe wav (%s); falling back to single shot", e)
+        return mlx_whisper_mod.transcribe(path_str, **whisper_kw), 1
+
+    sr = int(info.samplerate)
+    total_frames = int(info.frames)
+    if sr <= 0 or total_frames <= 0:
+        return mlx_whisper_mod.transcribe(path_str, **whisper_kw), 1
+
+    chunk_frames = max(int(chunk_sec * sr), sr)
+    overlap_frames = int(overlap_sec * sr)
+    overlap_frames = min(overlap_frames, chunk_frames // 2)
+    step_frames = max(sr, chunk_frames - overlap_frames)
+
+    _LOG.info(
+        "mlx: chunked transcribe chunk_sec=%.1f overlap_sec=%.1f sr=%d frames=%d step_frames=%d",
+        chunk_sec,
+        overlap_sec,
+        sr,
+        total_frames,
+        step_frames,
+    )
+
+    try:
+        import mlx.core as mx
+    except ImportError:
+        mx = None
+
+    all_segments: list[dict] = []
+    start_f = 0
+    chunk_idx = 0
+    n_chunks = 0
+    prev_local: list[dict] = []
+    base_prompt = str(whisper_kw.get("initial_prompt") or "")
+    forced_lang = whisper_kw.get("language")
+    last_result: dict[str, Any] = {}
+
+    while start_f < total_frames:
+        frames_to_read = min(chunk_frames, total_frames - start_f)
+        try:
+            audio_np, _sr = sf.read(
+                path_str,
+                dtype="float32",
+                always_2d=False,
+                start=start_f,
+                frames=frames_to_read,
+            )
+        except OSError as e:
+            _LOG.error("mlx: failed reading chunk at frame %d: %s", start_f, e)
+            raise
+
+        if isinstance(audio_np, np.ndarray) and audio_np.ndim > 1:
+            audio_np = np.mean(audio_np, axis=1).astype(np.float32, copy=False)
+        elif isinstance(audio_np, np.ndarray) and audio_np.dtype != np.float32:
+            audio_np = audio_np.astype(np.float32, copy=False)
+
+        t0_sec = start_f / float(sr)
+        chunk_kw = dict(whisper_kw)
+        if chunk_idx > 0 and overlap_sec > 0 and prev_local:
+            chunk_kw["initial_prompt"] = _mlx_carry_prompt(base_prompt, prev_local)
+        if forced_lang is not None:
+            chunk_kw["language"] = forced_lang
+
+        _LOG.info(
+            "mlx: transcribe chunk %d start_frame=%d n_frames=%d wall_time %.2f–%.2fs",
+            chunk_idx + 1,
+            start_f,
+            frames_to_read,
+            t0_sec,
+            (start_f + frames_to_read) / float(sr),
+        )
+        last_result = mlx_whisper_mod.transcribe(audio_np, **chunk_kw)
+        n_chunks += 1
+
+        if forced_lang is None and last_result.get("language"):
+            forced_lang = last_result["language"]
+            whisper_kw["language"] = forced_lang
+
+        segs = list(last_result.get("segments") or [])
+        drop_le = overlap_sec if chunk_idx > 0 and overlap_sec > 0 else None
+        all_segments.extend(_mlx_offset_segments(segs, t0_sec, drop_end_local_le=drop_le))
+        prev_local = segs
+
+        if mx is not None:
+            try:
+                mx.clear_cache()
+            except Exception:
+                pass
+        gc.collect()
+
+        if start_f + frames_to_read >= total_frames:
+            break
+        start_f += step_frames
+        chunk_idx += 1
+
+    cleaned: list[dict] = []
+    for i, seg in enumerate(all_segments):
+        d = dict(seg)
+        d["id"] = i
+        d.pop("tokens", None)
+        cleaned.append(d)
+
+    full_text = " ".join(
+        (s.get("text") or "").strip() for s in cleaned if (s.get("text") or "").strip()
+    )
+    out_lang = forced_lang or last_result.get("language") or DEFAULT_WHISPER_LANGUAGE
+    return (
+        {
+            "text": full_text,
+            "segments": cleaned,
+            "language": out_lang,
+        },
+        n_chunks,
+    )
 
 
 def _pipeline_mode() -> str:
@@ -277,17 +530,207 @@ def _embedding_from_path(path: Path) -> np.ndarray | None:
         return None
 
 
+# WeSpeaker ONNX leaks allocator memory per extract_embedding call; batch size
+# trades subprocess count vs peak RAM per batch worker (~5–6 MB/call observed).
+_EMB_BATCH_SIZE = 600
+
+_EMB_BATCH_SCRIPT = '''
+import json, os, sys, tempfile
+import numpy as np
+import soundfile as sf
+import wespeakerruntime as wespeaker_rt
+
+windows = json.loads(sys.argv[1])
+audio_path = sys.argv[2]
+out_path = sys.argv[3]
+info = sf.info(audio_path)
+sr, total = info.samplerate, info.frames
+model = wespeaker_rt.Speaker(lang="en")
+results = []
+for ws, we, parent_idx in windows:
+    s0 = int(ws * sr)
+    n = min(int(we * sr), total) - s0
+    if n <= 0:
+        continue
+    tmp = None
+    try:
+        chunk, _ = sf.read(audio_path, start=s0, frames=n, dtype="float32")
+        if chunk.ndim > 1:
+            chunk = chunk.mean(axis=1)
+        fd, tmp = tempfile.mkstemp(suffix=".wav")
+        os.close(fd)
+        sf.write(tmp, chunk, sr)
+        del chunk
+        emb = model.extract_embedding(tmp)
+    except Exception:
+        continue
+    finally:
+        if tmp:
+            try: os.unlink(tmp)
+            except OSError: pass
+    if emb is not None:
+        e = np.asarray(emb)
+        if e.ndim == 2:
+            e = e[0]
+        results.append({"start": ws, "end": we, "parent_idx": parent_idx, "emb": e.tolist()})
+with open(out_path, "w") as f:
+    json.dump(results, f)
+'''
+
+
+def _diarize_worker(
+    audio_path: str,
+    num_speakers: int | None,
+    result_file: str,
+) -> None:
+    """Diarization worker: VAD in-process, embeddings in batched sub-subprocesses.
+
+    Each embedding batch runs in a fresh Python process that exits when done,
+    so the ONNX Runtime's leaked MALLOC arenas are fully reclaimed by the OS
+    between batches. Peak memory is bounded to ~batch_size * 5 MB.
+    """
+    import gc
+    import json
+    import os
+    import subprocess
+    import sys
+    import tempfile
+
+    import numpy as np
+
+    from diarize import _build_diarization_segments
+    from diarize.clustering import cluster_speakers
+    from diarize.utils import SubSegment
+    from diarize.vad import run_vad
+
+    MIN_SEG_DUR = 0.4
+    WINDOW = 1.2
+    STEP = 0.6
+
+    # ── Stage 1: VAD ──────────────────────────────────────────────────────
+    speech_segments = run_vad(audio_path)
+    gc.collect()
+
+    if not speech_segments:
+        with open(result_file, "w") as f:
+            json.dump([], f)
+        return
+
+    # ── Build all windows ─────────────────────────────────────────────────
+    all_windows: list[tuple[float, float, int]] = []
+    for idx, seg in enumerate(speech_segments):
+        seg_dur = seg.end - seg.start
+        if seg_dur < MIN_SEG_DUR:
+            continue
+        if seg_dur <= WINDOW * 1.5:
+            all_windows.append((seg.start, seg.end, idx))
+        else:
+            ws = seg.start
+            while ws + MIN_SEG_DUR < seg.end:
+                we = min(ws + WINDOW, seg.end)
+                all_windows.append((ws, we, idx))
+                ws += STEP
+
+    # ── Stage 2: batched embedding extraction in sub-subprocesses ─────────
+    embeddings: list[np.ndarray] = []
+    subsegments: list[SubSegment] = []
+
+    for batch_start in range(0, len(all_windows), _EMB_BATCH_SIZE):
+        batch = all_windows[batch_start : batch_start + _EMB_BATCH_SIZE]
+        fd, batch_out = tempfile.mkstemp(suffix=".json", prefix="alchemist-emb-")
+        os.close(fd)
+        try:
+            proc = subprocess.run(
+                [sys.executable, "-c", _EMB_BATCH_SCRIPT, json.dumps(batch), audio_path, batch_out],
+                capture_output=True,
+                timeout=300,
+            )
+            if proc.returncode != 0:
+                continue
+            with open(batch_out) as f:
+                batch_results = json.load(f)
+            for r in batch_results:
+                embeddings.append(np.asarray(r["emb"], dtype=np.float32))
+                subsegments.append(
+                    SubSegment(start=r["start"], end=r["end"], parent_idx=r["parent_idx"])
+                )
+        finally:
+            try:
+                os.unlink(batch_out)
+            except OSError:
+                pass
+
+    if not embeddings:
+        with open(result_file, "w") as f:
+            json.dump([], f)
+        return
+
+    emb_matrix = np.stack(embeddings)
+    del embeddings
+
+    # ── Stage 3: clustering (pure numpy/sklearn, lightweight) ─────────────
+    labels, _ = cluster_speakers(
+        emb_matrix,
+        min_speakers=1,
+        max_speakers=20,
+        num_speakers=num_speakers,
+    )
+    segments = _build_diarization_segments(speech_segments, subsegments, labels)
+    with open(result_file, "w") as f:
+        json.dump(
+            [
+                {"start": float(s.start), "end": float(s.end), "speaker": str(s.speaker)}
+                for s in segments
+            ],
+            f,
+        )
+
+
+def _run_diarize_subprocess(
+    audio_path: str,
+    num_speakers: int | None,
+) -> list[DiarSeg]:
+    """Run diarization in a subprocess so that all PyTorch/ONNX memory is freed on exit."""
+    import json
+    import multiprocessing as mp
+
+    fd, result_path = tempfile.mkstemp(suffix=".json", prefix="alchemist-diar-")
+    os.close(fd)
+    try:
+        ctx = mp.get_context("spawn")
+        p = ctx.Process(
+            target=_diarize_worker,
+            args=(audio_path, num_speakers, result_path),
+        )
+        p.start()
+        p.join()
+        if p.exitcode != 0:
+            _LOG.error("diarize subprocess exited with code %d", p.exitcode)
+            return [DiarSeg(0.0, _audio_duration_sf(Path(audio_path)) or 1.0, "SPEAKER_00")]
+        with open(result_path) as f:
+            raw = json.load(f)
+        return [DiarSeg(s["start"], s["end"], s["speaker"]) for s in raw]
+    finally:
+        try:
+            os.unlink(result_path)
+        except OSError:
+            pass
+
+
 def _embedding_from_time_range(path: Path, start: float, end: float) -> np.ndarray | None:
     start = max(0.0, start)
     end = max(start + 0.05, end)
     tmp_path: str | None = None
     try:
-        data, sr = sf.read(str(path))
-        if data.ndim > 1:
-            data = data.mean(axis=1)
+        info = sf.info(str(path))
+        sr = info.samplerate
         s0 = int(start * sr)
-        s1 = min(len(data), int(end * sr))
-        chunk = data[s0:s1]
+        n_frames = min(int(end * sr), info.frames) - s0
+        if n_frames <= 0:
+            return None
+        chunk, _ = sf.read(str(path), start=s0, frames=n_frames, dtype="float32")
+        if chunk.ndim > 1:
+            chunk = chunk.mean(axis=1)
         min_samples = max(3200, int(0.15 * sr))
         if len(chunk) < min_samples:
             return None
@@ -491,17 +934,7 @@ def _vad_filter_audio(
         if model is not None:
             del model
         del audio
-        gc.collect()
-        try:
-            if torch.backends.mps.is_available():
-                torch.mps.empty_cache()
-        except Exception:
-            pass
-        try:
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-        except Exception:
-            pass
+        _free_torch_memory()
 
 
 def _is_hallucinated_segment(text: str) -> bool:
@@ -610,11 +1043,15 @@ def _mlx_merge_tail_retranscribe(
         _LOG.warning("MLX tail retranscribe skipped (mlx_whisper missing): %s", e)
         return asr_result, 0
 
-    _LOG.debug("MLX tail retranscribe: reading work_inp=%s tail_sec=%s", work_inp, tail_sec)
-    audio, sr = sf.read(str(work_inp), dtype="float32")
-    if audio.ndim > 1:
-        audio = audio.mean(axis=1)
-    duration = float(len(audio)) / float(sr)
+    _LOG.debug("MLX tail retranscribe: probing work_inp=%s tail_sec=%s", work_inp, tail_sec)
+    try:
+        info = sf.info(str(work_inp))
+    except Exception as e:
+        _LOG.warning("MLX tail retranscribe: sf.info failed (%s); skipping", e)
+        return asr_result, 0
+    sr = int(info.samplerate)
+    total_frames = int(info.frames)
+    duration = float(total_frames) / float(sr) if sr > 0 else 0.0
     if duration <= tail_sec + 1.0:
         _LOG.debug(
             "MLX tail retranscribe skipped: duration=%.3fs too short for tail_sec=%s",
@@ -624,16 +1061,25 @@ def _mlx_merge_tail_retranscribe(
         return asr_result, 0
 
     offset = duration - tail_sec
-    i0 = int(round(offset * float(sr)))
-    chunk = audio[i0:]
-    if len(chunk) < int(0.5 * sr):
+    start_frame = max(0, int(round(offset * float(sr))))
+    frames_to_read = total_frames - start_frame
+    if frames_to_read < int(0.5 * sr):
         return asr_result, 0
+
+    chunk, _sr = sf.read(str(work_inp), dtype="float32", start=start_frame, frames=frames_to_read)
+    if chunk.ndim > 1:
+        chunk = chunk.mean(axis=1)
+    _LOG.debug(
+        "MLX tail retranscribe: read tail only start_frame=%d frames=%d (%.1fs) instead of full file",
+        start_frame, len(chunk), len(chunk) / float(sr),
+    )
 
     fd, tmp_name = tempfile.mkstemp(suffix=".wav", prefix="alchemist-tail-asr-")
     os.close(fd)
     tmp_path = Path(tmp_name)
     try:
         sf.write(str(tmp_path), chunk, sr, subtype="PCM_16")
+        del chunk
         tw: dict[str, Any] = dict(whisper_kw)
         tw["word_timestamps"] = False
         tail_result = mlx_whisper.transcribe(str(tmp_path), **tw)
@@ -976,6 +1422,8 @@ def main() -> int:
         mlx_decode_meta: dict[str, float] = {}
         mlx_tail_segments_merged = 0
         mlx_condition_on_previous_text = False
+        mlx_transcribe_chunks = 1
+        mlx_chunk_seconds_used = 0.0
 
         if mode == "torch":
             tok = _hf_token()
@@ -1046,8 +1494,8 @@ def main() -> int:
             pipeline_meta = "torch"
         else:
             import mlx_whisper
-            from diarize import diarize as run_diarize
 
+            _apply_mlx_cache_limit()
             _LOG.info("mlx: loading mlx_whisper and diarize backend")
             vad_path, vad_seg_count, vad_pad_ms, vad_tail_sec = _vad_filter_audio(
                 work_inp
@@ -1081,10 +1529,20 @@ def main() -> int:
             }
             _LOG.debug("mlx_whisper.transcribe kwargs=%r mlx_decode_meta=%r", safe_kw, mlx_decode_meta)
 
+            mlx_chunk_seconds_used = _mlx_chunk_seconds()
             t_asr0 = time.perf_counter()
             try:
-                _LOG.info("mlx: starting Whisper transcribe on %s", whisper_input)
-                asr_result = mlx_whisper.transcribe(whisper_input, **whisper_kw)
+                _LOG.info(
+                    "mlx: starting Whisper on %s (chunked=%s)",
+                    whisper_input,
+                    mlx_chunk_seconds_used > 0 and duration_audio > mlx_chunk_seconds_used + 0.5,
+                )
+                asr_result, mlx_transcribe_chunks = _mlx_transcribe_path_batched(
+                    Path(whisper_input),
+                    duration_audio,
+                    whisper_kw,
+                    mlx_whisper,
+                )
             finally:
                 if vad_path is not None:
                     try:
@@ -1095,8 +1553,9 @@ def main() -> int:
             asr_dt = time.perf_counter() - t_asr0
             n_seg0 = len(asr_result.get("segments") or [])
             _LOG.info(
-                "mlx: Whisper pass done in %.2fs segments=%d language=%r",
+                "mlx: Whisper pass done in %.2fs chunks=%d segments=%d language=%r",
                 asr_dt,
+                mlx_transcribe_chunks,
                 n_seg0,
                 asr_result.get("language"),
             )
@@ -1135,33 +1594,41 @@ def main() -> int:
                 ]
                 duration_audio = max(ends) if ends else 0.0
 
+            # Free Whisper model weights, token arrays, and MLX cache before
+            # diarization (CPU-only). diarize() loads its own Silero+WeSpeaker
+            # models and reads the full WAV twice internally.
+            for seg in asr_result.get("segments") or []:
+                seg.pop("tokens", None)
+            try:
+                from mlx_whisper.transcribe import ModelHolder
+                import mlx.core as mx
+                ModelHolder.model = None
+                ModelHolder.model_path = None
+                mx.clear_cache()
+                gc.collect()
+                _LOG.info(
+                    "mlx: unloaded Whisper model + cleared MLX cache before diarization (cache_bytes=%d)",
+                    mx.get_cache_memory(),
+                )
+            except Exception as e:
+                _LOG.warning("mlx: failed to unload model: %s", e)
+
             t_diar0 = time.perf_counter()
             _LOG.info(
-                "mlx: starting diarize() on full normalized wav=%s num_speakers=%r",
+                "diar: starting subprocess pipeline on wav=%s num_speakers=%r",
                 work_inp,
                 num_speakers,
             )
-            dresult = run_diarize(
-                str(work_inp),
-                num_speakers=num_speakers,
-                min_speakers=1,
-                max_speakers=20,
-            )
+            diar = _run_diarize_subprocess(str(work_inp), num_speakers)
             diar_dt = time.perf_counter() - t_diar0
-            diar = [
-                DiarSeg(float(s.start), float(s.end), str(s.speaker))
-                for s in dresult.segments
-            ]
             _LOG.info(
-                "mlx: diarize done in %.2fs raw_segments=%d audio_duration=%r",
+                "diar: subprocess done in %.2fs segments=%d",
                 diar_dt,
                 len(diar),
-                getattr(dresult, "audio_duration", None),
             )
             if not diar:
-                span = float(dresult.audio_duration or duration_audio or 1.0)
-                _LOG.warning("mlx: diarize returned no segments; using single SPEAKER_00")
-                diar = [DiarSeg(0.0, span, "SPEAKER_00")]
+                _LOG.warning("diar: empty result; using single SPEAKER_00")
+                diar = [DiarSeg(0.0, max(duration_audio, 1.0), "SPEAKER_00")]
 
             try:
                 diarize_ver = importlib.metadata.version("diarize")
@@ -1203,6 +1670,13 @@ def main() -> int:
         else:
             label_map = _chronological_label_map(diar)
             _LOG.info("enrollment: skipped; chronological labels=%s", label_map)
+
+        # Free the global WeSpeaker model after enrollment is done
+        global _ws_model
+        if _ws_model is not None:
+            _ws_model = None
+            gc.collect()
+            _LOG.debug("enrollment: freed global _ws_model")
 
         asr_text_fix_substitutions = 0
         pieces: list[tuple[float, float, str, str]] = []
@@ -1289,6 +1763,10 @@ def main() -> int:
             meta["mlx_tail_segments_merged"] = mlx_tail_segments_merged
             meta["condition_on_previous_text"] = mlx_condition_on_previous_text
             meta["hallucinated_segments_removed"] = halluc_removed
+            meta["mlx_transcribe_chunks"] = mlx_transcribe_chunks
+            if mlx_transcribe_chunks > 1:
+                meta["mlx_chunk_seconds"] = mlx_chunk_seconds_used
+                meta["mlx_chunk_overlap_seconds"] = _mlx_chunk_overlap_seconds()
             if mlx_decode_meta:
                 meta["mlx_whisper_decode_overrides"] = mlx_decode_meta
         if enroll_dir is not None:
