@@ -33,6 +33,11 @@ Env:
   ALCHEMIST_OPENAI_WHISPER_MODEL — openai-whisper model name (torch pipeline only; default large-v3).
   ALCHEMIST_WHISPER_DEVICE — torch ASR device: auto | cpu | mps | cuda (torch pipeline; auto uses CPU on macOS because openai-whisper is not MPS-safe).
   ALCHEMIST_DIARIZATION_DEVICE — pyannote device: cpu | mps | cuda (torch pipeline; default cpu).
+  ALCHEMIST_QUIET — 1 | 0 (default) — same as CLI --quiet: suppress ffmpeg warnings on stderr only.
+  ALCHEMIST_VERBOSE_META — 1 | 0 (default) — same as CLI --verbose: full YAML frontmatter (debug/diagnostic
+    fields). Default output uses a short frontmatter only.
+  ALCHEMIST_NO_LOG_FILE — 1 | 0 (default) — disable per-run debug log file under logs/ (or ALCHEMIST_LOG_DIR).
+  ALCHEMIST_LOG_DIR — optional absolute directory for run log files (default: <repo>/logs).
 """
 
 from __future__ import annotations
@@ -40,6 +45,7 @@ from __future__ import annotations
 import argparse
 import gc
 import hashlib
+import logging
 import importlib.metadata
 import os
 import re
@@ -59,8 +65,15 @@ from audio_preprocess import PIPELINE_SAMPLE_RATE_HZ, normalize_to_pipeline_wav
 from diar_types import DiarSeg
 from enrollment_util import resolve_enrollment_directory, resolve_role_clip
 from transcript_fixes import apply_transcript_text_fixes, asr_text_fixes_enabled
+from run_logging import (
+    configure_run_logging,
+    flush_run_log,
+    log_alchemist_env,
+    log_process_banner,
+)
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
+_LOG = logging.getLogger("alchemist.transcribe")
 
 DEFAULT_INITIAL_PROMPT = (
     "Психотерапевтическая беседа на русском, возможны вкрапления английского. "
@@ -418,10 +431,20 @@ def _vad_filter_audio(
     """
     pad_ms = _vad_speech_pad_ms()
     tail_sec = _vad_tail_preserve_seconds()
+    _LOG.debug(
+        "VAD prefilter start path=%s speech_pad_ms=%s tail_preserve_sec=%s",
+        audio_path,
+        pad_ms,
+        tail_sec,
+    )
     try:
         import torch
         from silero_vad import get_speech_timestamps, load_silero_vad
-    except ImportError:
+    except ImportError as e:
+        _LOG.warning(
+            "VAD prefilter skipped (silero/torch unavailable): %s — Whisper uses full normalized wav",
+            e,
+        )
         return None, 0, pad_ms, tail_sec
 
     audio, sr = sf.read(str(audio_path), dtype="float32")
@@ -437,6 +460,7 @@ def _vad_filter_audio(
             wav_t, model, sampling_rate=sr, speech_pad_ms=pad_ms
         )
         if not speech_ts:
+            _LOG.info("VAD: no speech regions; Whisper input is full normalized audio")
             return None, 0, pad_ms, tail_sec
 
         filtered = np.zeros_like(audio)
@@ -452,7 +476,15 @@ def _vad_filter_audio(
         fd, tmp_name = tempfile.mkstemp(suffix=".wav", prefix="alchemist-vad-")
         os.close(fd)
         sf.write(tmp_name, filtered, sr, subtype="PCM_16")
-        return Path(tmp_name), len(speech_ts), pad_ms, tail_sec
+        p = Path(tmp_name)
+        _LOG.info(
+            "VAD: masked wav written path=%s speech_segments=%d audio_samples=%d sr=%d",
+            p,
+            len(speech_ts),
+            len(audio),
+            int(sr),
+        )
+        return p, len(speech_ts), pad_ms, tail_sec
     finally:
         if wav_t is not None:
             del wav_t
@@ -566,17 +598,29 @@ def _mlx_merge_tail_retranscribe(
     Returns (possibly updated asr_result, number of segments appended).
     """
     if tail_sec <= 0.0 or not _mlx_tail_retranscribe_enabled():
+        _LOG.debug(
+            "MLX tail retranscribe skipped (tail_sec=%s enabled=%s)",
+            tail_sec,
+            _mlx_tail_retranscribe_enabled(),
+        )
         return asr_result, 0
     try:
         import mlx_whisper
-    except ImportError:
+    except ImportError as e:
+        _LOG.warning("MLX tail retranscribe skipped (mlx_whisper missing): %s", e)
         return asr_result, 0
 
+    _LOG.debug("MLX tail retranscribe: reading work_inp=%s tail_sec=%s", work_inp, tail_sec)
     audio, sr = sf.read(str(work_inp), dtype="float32")
     if audio.ndim > 1:
         audio = audio.mean(axis=1)
     duration = float(len(audio)) / float(sr)
     if duration <= tail_sec + 1.0:
+        _LOG.debug(
+            "MLX tail retranscribe skipped: duration=%.3fs too short for tail_sec=%s",
+            duration,
+            tail_sec,
+        )
         return asr_result, 0
 
     offset = duration - tail_sec
@@ -622,10 +666,12 @@ def _mlx_merge_tail_retranscribe(
         added += 1
 
     if added == 0:
+        _LOG.debug("MLX tail retranscribe: no new segments merged from tail pass")
         return asr_result, 0
     main_segs.sort(key=lambda x: float(x["start"]))
     out = dict(asr_result)
     out["segments"] = main_segs
+    _LOG.info("MLX tail retranscribe: merged %d segment(s) from tail-only pass", added)
     return out, added
 
 
@@ -783,6 +829,35 @@ def _atomic_write_text(path: Path, content: str) -> None:
         raise
 
 
+def _transcribe_quiet() -> bool:
+    raw = os.environ.get("ALCHEMIST_QUIET", "").strip().lower()
+    return raw in ("1", "true", "yes", "on")
+
+
+def _transcribe_verbose_meta() -> bool:
+    raw = os.environ.get("ALCHEMIST_VERBOSE_META", "").strip().lower()
+    return raw in ("1", "true", "yes", "on")
+
+
+def _minimal_transcript_meta(meta: dict[str, Any]) -> dict[str, Any]:
+    """Strip debug/diagnostic frontmatter keys for downstream tools (e.g. OpenClaw)."""
+    keys = (
+        "source_path",
+        "source_sha256",
+        "audio_duration_seconds",
+        "word_count",
+        "interruption_count",
+        "language",
+        "pipeline",
+        "asr_model",
+        "diarization_backend",
+        "speaker_assignment_strategy",
+        "speaker_label_map",
+        "generated_at_utc",
+    )
+    return {k: meta[k] for k in keys if k in meta}
+
+
 def _build_markdown(
     meta: dict[str, Any],
     blocks: list[tuple[str, float, float, str]],
@@ -805,24 +880,62 @@ def main() -> int:
     load_dotenv(_REPO_ROOT / ".env")
     load_dotenv()
 
+    log_path = configure_run_logging("transcribe")
+    if log_path is not None:
+        print(f"alchemist: full debug log: {log_path}", file=sys.stderr)
+    log_process_banner(_LOG)
+    log_alchemist_env(_LOG)
+
     parser = argparse.ArgumentParser(
         description="Whisper ASR + diarization → markdown transcript (MLX or PyTorch pipeline)."
     )
     parser.add_argument("--input", required=True, type=Path, help="Input audio file")
     parser.add_argument(
-        "--output", required=True, type=Path, help="Output .md path"
+        "--output", required=True, type=Path, help="Output .md path (any directory; created if needed)"
+    )
+    parser.add_argument(
+        "--quiet",
+        action="store_true",
+        help="Suppress ffmpeg warnings on stderr (does not change YAML; default frontmatter is already short).",
+    )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Write full YAML frontmatter (VAD stats, tail merge, package versions, enrollment paths, etc.).",
     )
     args = parser.parse_args()
     inp: Path = args.input.expanduser().resolve()
     out: Path = args.output.expanduser().resolve()
+    quiet = bool(args.quiet) or _transcribe_quiet()
+    verbose_meta = bool(args.verbose) or _transcribe_verbose_meta()
+    _LOG.info(
+        "cli: input=%s output=%s quiet=%s verbose_meta=%s",
+        inp,
+        out,
+        quiet,
+        verbose_meta,
+    )
 
     if not inp.is_file():
         print(f"error: input not found: {inp}", file=sys.stderr)
+        _LOG.error("input not found: %s", inp)
+        flush_run_log()
         return 1
 
     digest = _sha256_file(inp)
     existing = _read_frontmatter_sha256(out)
+    _LOG.debug(
+        "idempotency check: existing_frontmatter_sha256=%s computed_input_sha256=%s",
+        existing,
+        digest,
+    )
     if existing == digest:
+        _LOG.info(
+            "exit 0 (idempotent): output already matches input sha256=%s… out=%s",
+            digest[:20],
+            out,
+        )
+        flush_run_log()
         return 0
 
     _ip_env = os.environ.get("ALCHEMIST_INITIAL_PROMPT")
@@ -832,19 +945,34 @@ def main() -> int:
         initial_prompt = _ip_env.strip() or DEFAULT_INITIAL_PROMPT
     lang = _alchemist_language()
     num_speakers = _num_speakers_arg()
+    _LOG.info(
+        "decode options: language=%r num_speakers=%s initial_prompt_len=%d chars (env override=%s)",
+        lang,
+        num_speakers,
+        len(initial_prompt),
+        _ip_env is not None,
+    )
 
     t_wall0 = time.perf_counter()
 
-    work_inp, tmp_normalized = normalize_to_pipeline_wav(inp)
+    _LOG.info("normalizing audio via ffmpeg (if needed) input=%s quiet=%s", inp, quiet)
+    work_inp, tmp_normalized = normalize_to_pipeline_wav(inp, quiet=quiet)
     preprocess = (
         "none"
         if tmp_normalized is None
         else f"ffmpeg_pcm_s16le_{PIPELINE_SAMPLE_RATE_HZ}hz_mono_wav"
     )
+    _LOG.info(
+        "normalize result: work_inp=%s temp_normalized=%s preprocess=%s",
+        work_inp,
+        tmp_normalized,
+        preprocess,
+    )
 
     try:
         duration_audio = _audio_duration_sf(work_inp)
         mode = _pipeline_mode()
+        _LOG.info("pipeline_mode=%s audio_duration_seconds=%.3f", mode, duration_audio)
         mlx_decode_meta: dict[str, float] = {}
         mlx_tail_segments_merged = 0
         mlx_condition_on_previous_text = False
@@ -857,6 +985,8 @@ def main() -> int:
                     "HUGGING_FACE_HUB_TOKEN) for pyannote models.",
                     file=sys.stderr,
                 )
+                _LOG.error("torch pipeline: missing HF_TOKEN / HUGGING_FACE_HUB_TOKEN")
+                flush_run_log()
                 return 1
             try:
                 from torch_pipeline import PYANNOTE_MODEL, run_openai_whisper_pyannote
@@ -867,8 +997,14 @@ def main() -> int:
                     file=sys.stderr,
                 )
                 print(e, file=sys.stderr)
+                _LOG.exception("torch pipeline: import error: %s", e)
+                flush_run_log()
                 return 1
 
+            _LOG.info(
+                "torch: starting ASR+diarization model=%s whisper_dev will be reported",
+                _openai_whisper_model(),
+            )
             asr_result, diar, dur2, whisper_dev, dia_dev = run_openai_whisper_pyannote(
                 work_inp,
                 hf_token=tok,
@@ -876,6 +1012,14 @@ def main() -> int:
                 language=lang,
                 whisper_model=_openai_whisper_model(),
                 num_speakers=num_speakers,
+            )
+            n_asr_seg = len(asr_result.get("segments") or [])
+            _LOG.info(
+                "torch: ASR+diarization done segments=%d diar_labels=%d whisper_dev=%s diar_dev=%s",
+                n_asr_seg,
+                len(diar),
+                whisper_dev,
+                dia_dev,
             )
             if duration_audio <= 0.0:
                 duration_audio = dur2
@@ -885,6 +1029,7 @@ def main() -> int:
                 ]
                 duration_audio = max(ends) if ends else 0.0
             if not diar:
+                _LOG.warning("torch: empty diarization; using single SPEAKER_00 span")
                 diar = [DiarSeg(0.0, max(duration_audio, 1.0), "SPEAKER_00")]
 
             try:
@@ -903,10 +1048,19 @@ def main() -> int:
             import mlx_whisper
             from diarize import diarize as run_diarize
 
+            _LOG.info("mlx: loading mlx_whisper and diarize backend")
             vad_path, vad_seg_count, vad_pad_ms, vad_tail_sec = _vad_filter_audio(
                 work_inp
             )
             whisper_input = str(vad_path) if vad_path else str(work_inp)
+            _LOG.info(
+                "mlx: whisper_input=%s (vad_temp=%s) vad_speech_segments=%s pad_ms=%s tail_preserve_sec=%s",
+                whisper_input,
+                vad_path is not None,
+                vad_seg_count,
+                vad_pad_ms,
+                vad_tail_sec,
+            )
 
             mlx_condition_on_previous_text = _mlx_condition_on_previous_text()
             whisper_kw: dict[str, Any] = {
@@ -921,7 +1075,15 @@ def main() -> int:
             if lang:
                 whisper_kw["language"] = lang
 
+            safe_kw = {
+                k: (f"<{len(v)} chars>" if k == "initial_prompt" and isinstance(v, str) else v)
+                for k, v in whisper_kw.items()
+            }
+            _LOG.debug("mlx_whisper.transcribe kwargs=%r mlx_decode_meta=%r", safe_kw, mlx_decode_meta)
+
+            t_asr0 = time.perf_counter()
             try:
+                _LOG.info("mlx: starting Whisper transcribe on %s", whisper_input)
                 asr_result = mlx_whisper.transcribe(whisper_input, **whisper_kw)
             finally:
                 if vad_path is not None:
@@ -930,11 +1092,27 @@ def main() -> int:
                     except OSError:
                         pass
 
+            asr_dt = time.perf_counter() - t_asr0
+            n_seg0 = len(asr_result.get("segments") or [])
+            _LOG.info(
+                "mlx: Whisper pass done in %.2fs segments=%d language=%r",
+                asr_dt,
+                n_seg0,
+                asr_result.get("language"),
+            )
+
             if duration_audio <= 0.0:
                 duration_audio = _audio_duration_sf(work_inp)
             asr_result = _mlx_sanitize_segments_before_tail_merge(
                 asr_result, duration=duration_audio
             )
+            n_seg1 = len(asr_result.get("segments") or [])
+            if n_seg1 != n_seg0:
+                _LOG.debug(
+                    "mlx: after subtitle/end sanitize segments %d -> %d",
+                    n_seg0,
+                    n_seg1,
+                )
 
             asr_result, mlx_tail_segments_merged = _mlx_merge_tail_retranscribe(
                 work_inp,
@@ -943,6 +1121,13 @@ def main() -> int:
                 whisper_kw=whisper_kw,
             )
             asr_result, halluc_removed = _filter_hallucinated_segments(asr_result)
+            n_seg2 = len(asr_result.get("segments") or [])
+            _LOG.info(
+                "mlx: post tail-merge + hallucination filter: final_segments=%d tail_merged=%d halluc_removed=%d",
+                n_seg2,
+                mlx_tail_segments_merged,
+                halluc_removed,
+            )
 
             if duration_audio <= 0.0:
                 ends = [
@@ -950,18 +1135,32 @@ def main() -> int:
                 ]
                 duration_audio = max(ends) if ends else 0.0
 
+            t_diar0 = time.perf_counter()
+            _LOG.info(
+                "mlx: starting diarize() on full normalized wav=%s num_speakers=%r",
+                work_inp,
+                num_speakers,
+            )
             dresult = run_diarize(
                 str(work_inp),
                 num_speakers=num_speakers,
                 min_speakers=1,
                 max_speakers=20,
             )
+            diar_dt = time.perf_counter() - t_diar0
             diar = [
                 DiarSeg(float(s.start), float(s.end), str(s.speaker))
                 for s in dresult.segments
             ]
+            _LOG.info(
+                "mlx: diarize done in %.2fs raw_segments=%d audio_duration=%r",
+                diar_dt,
+                len(diar),
+                getattr(dresult, "audio_duration", None),
+            )
             if not diar:
                 span = float(dresult.audio_duration or duration_audio or 1.0)
+                _LOG.warning("mlx: diarize returned no segments; using single SPEAKER_00")
                 diar = [DiarSeg(0.0, span, "SPEAKER_00")]
 
             try:
@@ -981,17 +1180,29 @@ def main() -> int:
             )
 
         enroll_dir, enroll_source = resolve_enrollment_directory()
+        _LOG.info(
+            "enrollment: directory=%s source=%s",
+            enroll_dir,
+            enroll_source,
+        )
         strategy = "chronological"
         label_map: dict[str, str]
         if enroll_dir is not None:
+            _LOG.debug("enrollment: running WeSpeaker embedding label map")
             emb_map = _wespeaker_embedding_label_map(diar, enroll_dir, work_inp)
             if emb_map is not None:
                 label_map = emb_map
                 strategy = "embedding_enrollment_wespeaker"
+                _LOG.info("enrollment: strategy=%s label_map=%s", strategy, label_map)
             else:
                 label_map = _chronological_label_map(diar)
+                _LOG.warning(
+                    "enrollment: WeSpeaker map failed; fallback chronological labels=%s",
+                    label_map,
+                )
         else:
             label_map = _chronological_label_map(diar)
+            _LOG.info("enrollment: skipped; chronological labels=%s", label_map)
 
         asr_text_fix_substitutions = 0
         pieces: list[tuple[float, float, str, str]] = []
@@ -1083,8 +1294,18 @@ def main() -> int:
         if enroll_dir is not None:
             meta["enrollment_dir"] = str(enroll_dir)
 
-        md = _build_markdown(meta, blocks)
+        meta_out = meta if verbose_meta else _minimal_transcript_meta(meta)
+        md = _build_markdown(meta_out, blocks)
+        _LOG.info(
+            "writing markdown: path=%s blocks=%d words=%d processing_time=%.2fs verbose_meta=%s",
+            out,
+            len(blocks),
+            word_count,
+            proc_sec,
+            verbose_meta,
+        )
         _atomic_write_text(out, md)
+        _LOG.info("success: wrote transcript bytes=%d", len(md.encode("utf-8")))
         return 0
     finally:
         if tmp_normalized is not None:
@@ -1092,3 +1313,4 @@ def main() -> int:
                 tmp_normalized.unlink(missing_ok=True)
             except OSError:
                 pass
+        flush_run_log()

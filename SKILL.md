@@ -1,68 +1,83 @@
 # Alchemist transcriber (OpenClaw)
 
-Use this repo to turn user-supplied audio into a **markdown transcript** with **diarized speakers** (default labels **Danil** and **Therapist**) and **YAML metadata** (durations, word count, interruption count).
+Use this repo to turn **therapy session audio** into a **markdown transcript**: diarized speakers, timestamps per turn, and a **YAML header** for automation. Intended when the user (or OpenClaw) supplies a file path and needs a stable `.md` artifact.
 
-**Default:** **mlx-whisper** (`large-v3` MLX weights) + **CPU diarization** via [`diarize`](https://pypi.org/project/diarize/) (Silero VAD + WeSpeaker ONNX).
+## Best quality (recommended)
 
-**Alternate:** `ALCHEMIST_PIPELINE=torch` — **openai-whisper** (`large-v3` by default) + **pyannote** `speaker-diarization-3.1`. Requires `uv sync --extra torch-pipeline`, **`HF_TOKEN`**, and Hub acceptance for pyannote models.
+For **Russian therapy** recordings on **Apple Silicon**, use the **defaults** — no need to set `ALCHEMIST_PIPELINE`:
+
+| Stage | What runs |
+|-------|-----------|
+| **Normalize** | **ffmpeg** → 16 kHz mono PCM WAV (reliable decode for `.m4a`, `.qta`, etc.) |
+| **VAD prefilter (MLX only)** | **Silero** masks non-speech before Whisper; **tail preserve** (last ~25 s) keeps quiet outros |
+| **ASR** | **mlx-whisper** with Hub weights (default `mlx-community/whisper-large-v3-mlx`) |
+| **Diarization** | **[`diarize`](https://pypi.org/project/diarize/)** on the **full normalized** WAV (Silero + WeSpeaker ONNX on CPU) |
+| **Labels** | Optional **`./enrollments`** with `danil.*` / `therapist.*` → **WeSpeaker** mapping to names; else **chronological** Danil / Therapist |
+| **Cleanup** | Repeat-token scrub + **`transcript_fixes`** (hyphens, names like Тея, therapy phrases) |
+
+**Do not** switch to `torch` unless you have a reason (pyannote needs **`HF_TOKEN`** and Hub model acceptance). The MLX + `diarize` path is the supported “good transcript” stack here.
+
+**Requirements:** **ffmpeg** on `PATH`, **uv**, macOS + Apple Silicon for MLX. Install: `cd …/alchemist-transcriber && uv sync`.
+
+## Commands OpenClaw should run
+
+Always pass **absolute paths** for `--input` and **`--output`** so the markdown lands where the orchestrator expects (any folder; parents are created).
+
+```bash
+cd /path/to/alchemist-transcriber
+uv run transcribe \
+  --input "/absolute/path/to/session.m4a" \
+  --output "/absolute/path/to/transcripts/session.md"
+```
+
+- **`--input`**: one audio file (session).
+- **`--output`**: target **`.md`** path (required). Idempotency uses `source_sha256` in the file header vs the input file.
+- **YAML `---` block:** **short by default** (hash, duration, word count, language, pipeline, ASR/diarization ids, speaker map, timestamp). For **debug / tuning**, add **`--verbose`** or **`ALCHEMIST_VERBOSE_META=1`** to dump the full header (VAD counts, tail merge, versions, `enrollment_dir`, scrub flags, MLX overrides, etc.).
+- **`--quiet`** or **`ALCHEMIST_QUIET=1`**: only suppresses **ffmpeg** warnings on stderr; it does **not** change the frontmatter (default is already short).
+
+**Working directory:** Run from the repo root (or anywhere **`uv`** resolves the project). If **`./enrollments`** exists in the **current working directory** and contains `danil.*` + `therapist.*`, enrollment runs automatically. To force clips from elsewhere: `export ALCHEMIST_ENROLLMENT_DIR=/absolute/path/to/enrollments`. To disable: `export ALCHEMIST_ENROLLMENT_DIR=none`.
 
 ## When to use
 
-- The user attaches or points to an audio file and wants a clean `.md` transcript with speaker turns and quality-oriented ASR.
-
-## One-shot command
-
-From the repo root (after setup below):
-
-```bash
-uv run transcribe --input "/absolute/path/to/audio.m4a" --output "/absolute/path/to/out.md"
-```
+- User attaches or paths an audio file and wants a **structured transcript** (two speakers, therapy-oriented defaults).
+- OpenClaw post-processes sessions: run `transcribe`, then read the `## Transcript` body and/or YAML.
 
 ## Setup (once per machine)
 
-1. Install [uv](https://docs.astral.sh/uv/getting-started/installation/) and use Python 3.10+ (Apple Silicon Mac: M4 is supported; ASR runs via **MLX**; diarization runs on **CPU** and is chosen for speed there).
-2. Install dependencies into the project environment:
+1. Install [uv](https://docs.astral.sh/uv/getting-started/installation/) and Python 3.10+.
+2. `cd alchemist-transcriber && uv sync`.
+3. Ensure **ffmpeg** is installed and on `PATH`.
+4. Optional: copy **`.env.example`** → **`.env`** (e.g. `ALCHEMIST_QUIET=1` for silent stderr in batch runs).
+5. Optional enrollment: see **README.md** (`enrollments/danil.*`, `therapist.*`, `uv run alchemist-check-enrollment`).
 
-   ```bash
-   cd /path/to/alchemist-transcriber
-   uv sync
-   ```
+## Behaviour to rely on
 
-   For the PyTorch + pyannote path: `uv sync --extra torch-pipeline` and set **`HF_TOKEN`** (see README). Optional: copy **`.env.example`** → **`.env`** in the run directory; the CLIs load it automatically.
+- **Idempotent:** if `--output` exists and frontmatter **`source_sha256`** matches the current input, exit **0** without re-running models.
+- **Non-interactive:** no prompts.
+- **Speaker names:** without enrollment, first two clusters in time order → **Danil**, **Therapist**; with enrollment → **WeSpeaker** match when clips are valid.
+- **Language:** default **`ru`** if `ALCHEMIST_LANGUAGE` is unset; use `auto` only if the session language is mixed or unknown.
 
-   Run the CLI with `uv run transcribe ...`. With an activated venv: `transcribe ...`. See **README.md** for enrollment (`ALCHEMIST_ENROLLMENT_DIR`, `danil.wav` / `therapist.wav`) and `uv run alchemist-check-enrollment --dir ...`.
-
-3. **ffmpeg** on PATH is expected: the **session file** and **enrollment** clips (`danil.*`, `therapist.*`) are normalized to **16 kHz mono PCM WAV** before ASR/diarization and before WeSpeaker embeddings. Without ffmpeg, originals are used and the tool may warn.
-4. **Hugging Face**: default MLX diarization needs no token. **`ALCHEMIST_PIPELINE=torch`** requires **`HF_TOKEN`** for pyannote. MLX Whisper Hub limits: set `HF_TOKEN` as usual.
-
-## Behaviour the agent should rely on
-
-- **Idempotent**: if `--output` already exists and its YAML frontmatter `source_sha256` matches the current input file, the script **exits 0 immediately** (no rework).
-- **No prompts**: non-interactive only.
-- **Speaker names**: without enrollment, the **first two** diarization clusters in **chronological order** are named **Danil** then **Therapist**; further clusters become `Speaker 3`, etc.
-- **Optional enrollment**: if **`./enrollments`** exists in the **cwd**, it is used automatically for **`danil.*` / `therapist.*`** clips (e.g. `.wav`, `.m4a`). Override with `ALCHEMIST_ENROLLMENT_DIR`; set to `none` to ignore `./enrollments`. Mapping uses **WeSpeaker** embeddings; on failure it falls back to chronological naming.
-
-## Useful environment variables
+## Useful environment variables (summary)
 
 | Variable | Role |
 |----------|------|
-| `ALCHEMIST_PIPELINE` | `mlx` (default) or `torch` (openai-whisper + pyannote) |
-| `HF_TOKEN` / `HUGGING_FACE_HUB_TOKEN` | **Required** for `torch` pipeline; optional for MLX Hub edge cases |
-| `ALCHEMIST_INITIAL_PROMPT` | Optional override; default is Russian therapy-oriented (relationships, substances/addiction, life themes, names e.g. Тея, Лара) |
-| `ALCHEMIST_LANGUAGE` | Default **`ru`** when env var absent; set `auto` or empty for auto-detect; or `en`, etc. |
-| `ALCHEMIST_NUM_SPEAKERS` | Default `2` (therapy-style); set to `auto` for automatic speaker count |
-| `ALCHEMIST_ENROLLMENT_DIR` | Optional override path for clips; unset uses `./enrollments` if present; `none`/`off`/`false`/`0` disables |
-| `ALCHEMIST_SKIP_FFMPEG_NORMALIZE` | `1`/`true`/`yes` skips ffmpeg (original file only) |
-| `ALCHEMIST_WHISPER_REPO` | MLX pipeline: Hub repo for MLX Whisper (default large-v3; turbo: `mlx-community/whisper-large-v3-turbo`) |
-| `ALCHEMIST_VAD_SPEECH_PAD_MS` / `ALCHEMIST_VAD_TAIL_PRESERVE_SEC` | MLX VAD: Silero `speech_pad_ms` (default 200); **tail preserve** (default 25 s) copies raw audio at EOF into the VAD-masked WAV |
-| `ALCHEMIST_MLX_TAIL_RETRANSCRIBE` | Default on: second Whisper pass on that tail (normalized WAV) + merge, fixes dropped quiet closing lines after full pass |
-| `ALCHEMIST_MLX_CONDITION_ON_PREVIOUS_TEXT` | Default off; set `1` for mlx_whisper `condition_on_previous_text` (context carry-over; may help names, may worsen repeat hallucinations) |
-| `ALCHEMIST_SCRUB_REPEAT_TOKENS` | Default on: strip repeated 1-letter token runs (e.g. «в в в») from merged transcript blocks |
-| `ALCHEMIST_ASR_TEXT_FIXES` | Default on: hyphen spacing + name/typo rules in `src/transcript_fixes.py`; `0` disables |
-| `ALCHEMIST_MLX_*` decode thresholds | Optional MLX-only floats: `ALCHEMIST_MLX_NO_SPEECH_THRESHOLD`, `ALCHEMIST_MLX_LOGPROB_THRESHOLD`, `ALCHEMIST_MLX_COMPRESSION_RATIO_THRESHOLD`, `ALCHEMIST_MLX_HALLUCINATION_SILENCE_THRESHOLD` → `mlx_whisper.transcribe` |
-| `ALCHEMIST_OPENAI_WHISPER_MODEL` | Torch pipeline: openai-whisper model (default `large-v3`) |
-| `ALCHEMIST_WHISPER_DEVICE` / `ALCHEMIST_DIARIZATION_DEVICE` | Torch only: ASR / pyannote device (`auto`/`cpu`/`mps`/`cuda`; diarization defaults to `cpu`) |
+| `ALCHEMIST_VERBOSE_META` | Full YAML frontmatter (same as **`--verbose`**) |
+| `ALCHEMIST_QUIET` | Suppress ffmpeg stderr only (same as **`--quiet`**) |
+| `ALCHEMIST_PIPELINE` | `mlx` (default) or `torch` (only if pyannote path is required) |
+| `ALCHEMIST_INITIAL_PROMPT` | Override Whisper hint; default is Russian therapy-oriented (themes + names) |
+| `ALCHEMIST_LANGUAGE` | `ru` default; `auto` or empty for detect |
+| `ALCHEMIST_NUM_SPEAKERS` | Default `2`; `auto` for automatic count |
+| `ALCHEMIST_ENROLLMENT_DIR` | Override or disable (`none`) enrollment directory |
+| `ALCHEMIST_WHISPER_REPO` | MLX Hub repo (e.g. turbo variant) |
+| `ALCHEMIST_VAD_*` / `ALCHEMIST_MLX_TAIL_RETRANSCRIBE` | Tune VAD and tail re-transcribe (defaults are tuned for quiet endings) |
+| `ALCHEMIST_ASR_TEXT_FIXES` | `0` to disable `src/transcript_fixes.py` rules |
 
-## Output
+Full table: **README.md**.
 
-Markdown with a YAML frontmatter block plus a `## Transcript` section: blocks labeled by speaker with time ranges. Frontmatter includes `audio_duration_seconds`, `processing_time_seconds`, `word_count`, `interruption_count`, `audio_input_preprocess`, model ids, `diarization_backend`, and `source_sha256` for idempotency.
+## Output shape
+
+- **`---` YAML `---`** then **`## Transcript`** and blocks: `**Name** (MM:SS.mmm–MM:SS.mmm)` + paragraph text.
+- **Default** frontmatter: `source_path`, `source_sha256`, `audio_duration_seconds`, `word_count`, `interruption_count`, `language`, `pipeline`, `asr_model`, `diarization_backend`, `speaker_assignment_strategy`, `speaker_label_map`, `generated_at_utc`.
+- **`--verbose`:** adds debug keys (VAD, tail, versions, enrollment path, scrub/fix toggles, MLX overrides, etc.).
+
+See **README.md** for torch/HF token details and enrollment clips.

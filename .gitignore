@@ -9,6 +9,7 @@ __pycache__/
 data/
 output/
 embeddings/
+logs/
 
 # Speaker enrollment clips are local/private; add danil.* and therapist.* yourself.
 enrollments/*.wav

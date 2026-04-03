@@ -31,6 +31,7 @@ alchemist-check-enrollment = "check_enrollment:main"
 [tool.setuptools]
 py-modules = [
     "cli",
+    "run_logging",
     "check_enrollment",
     "enrollment_util",
     "audio_preprocess",

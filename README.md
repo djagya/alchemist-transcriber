@@ -62,6 +62,18 @@ If a directory named **`enrollments`** exists in the **current working directory
 uv run transcribe --input /path/to/session.m4a --output /path/to/out.md
 ```
 
+Use **`--output`** with any **absolute or relative path**; parent directories are created if missing.
+
+**YAML frontmatter:** by default the file gets a **short** header (source hash, duration, word count, language, pipeline, models, speaker map, timestamp). Use **`--verbose`** (or **`ALCHEMIST_VERBOSE_META=1`**) to include the **full** debug block (VAD segment counts, tail merge, package versions, `enrollment_dir`, scrub/fix flags, MLX decode overrides, etc.).
+
+**Stderr:** **`--quiet`** or **`ALCHEMIST_QUIET=1`** suppresses ffmpeg normalization warnings only.
+
+```bash
+uv run transcribe --input /path/to/session.m4a --output /path/to/out.md
+uv run transcribe --input /path/to/session.m4a --output /path/to/out.md --verbose
+uv run transcribe --input /path/to/session.m4a --output /path/to/out.md --quiet
+```
+
 ### Idempotency
 
 If `out.md` already exists and its YAML frontmatter `source_sha256` matches the current input file, the command **exits immediately** without re-running models.
@@ -129,7 +141,7 @@ export ALCHEMIST_ENROLLMENT_DIR=none
 uv run transcribe --input /path/to/session.m4a --output /path/to/out.md
 ```
 
-If embedding enrollment fails (missing clips, unreadable audio, etc.), the tool **falls back** to chronological naming. The output frontmatter includes `speaker_assignment_strategy` (`embedding_enrollment_wespeaker` vs `chronological`) and `enrollment_source` (`cwd_enrollments`, `env`, `disabled`, or `none`).
+If embedding enrollment fails (missing clips, unreadable audio, etc.), the tool **falls back** to chronological naming. The default frontmatter includes **`speaker_assignment_strategy`** (`embedding_enrollment_wespeaker` vs `chronological`). **`enrollment_source`** and **`enrollment_dir`** appear only with **`--verbose`** / **`ALCHEMIST_VERBOSE_META`**.
 
 ## Environment variables
 
@@ -149,6 +161,8 @@ If embedding enrollment fails (missing clips, unreadable audio, etc.), the tool 
 | `ALCHEMIST_MLX_CONDITION_ON_PREVIOUS_TEXT` | MLX only: set to `1` to enable Whisper `condition_on_previous_text` (carry text into the next window; may help names/context; can increase repetition hallucinations and runtime). Default **off** (omit or `0`). |
 | `ALCHEMIST_SCRUB_REPEAT_TOKENS` | `1` (default): remove runs of repeated single-letter tokens (common silence hallucinations like «в в в») when building each speaker block; `0` disables. |
 | `ALCHEMIST_ASR_TEXT_FIXES` | `1` (default): after scrub, normalize Whisper hyphen spacing (e.g. `что -то` → `что-то`, `из - за` → `из-за`) and apply small name/typo rules from `src/transcript_fixes.py`; `0` disables. Frontmatter: `asr_text_fixes`, `asr_text_fix_substitutions`. |
+| `ALCHEMIST_QUIET` | `1` / `true` / `yes`: same as **`--quiet`** — suppress ffmpeg warnings on stderr only. |
+| `ALCHEMIST_VERBOSE_META` | `1` / `true` / `yes`: same as **`--verbose`** — **full** YAML frontmatter (default is short). |
 | `ALCHEMIST_MLX_NO_SPEECH_THRESHOLD` | Optional. MLX only: float passed to `mlx_whisper.transcribe` (library default `0.6`). |
 | `ALCHEMIST_MLX_LOGPROB_THRESHOLD` | Optional. MLX only (default in lib: `-1.0`). |
 | `ALCHEMIST_MLX_COMPRESSION_RATIO_THRESHOLD` | Optional. MLX only (default in lib: `2.4`). |
@@ -157,7 +171,7 @@ If embedding enrollment fails (missing clips, unreadable audio, etc.), the tool 
 | `ALCHEMIST_WHISPER_DEVICE` | Torch pipeline only: `auto`, `cpu`, `mps`, or `cuda`. |
 | `ALCHEMIST_DIARIZATION_DEVICE` | Torch pipeline only: `cpu` (default), `mps`, or `cuda`. |
 
-Output YAML includes **`audio_input_preprocess`**: `ffmpeg_pcm_s16le_16000hz_mono_wav` when normalization ran, or `none` when skipped or ffmpeg was unavailable.
+With **`--verbose`** / **`ALCHEMIST_VERBOSE_META`**, the frontmatter also includes fields such as **`audio_input_preprocess`** (`ffmpeg_pcm_s16le_16000hz_mono_wav` when normalization ran, or `none` when skipped or ffmpeg was unavailable), **`enrollment_source`**, MLX VAD/tail counters, and package versions.
 
 ## Project layout
 
